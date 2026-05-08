@@ -18,6 +18,8 @@
 #define IRQ_HANDLER_ADDR 0x1200
 #define BP_INT_VECTOR	0x03
 #define BP_HANDLER_ADDR 0x1300
+#define UD_INT_VECTOR	0x06
+#define UD_HANDLER_ADDR 0x1400
 
 static const uint8_t guest_code[] = {
 	0x31, 0xc0,			/* xor eax, eax */
@@ -44,6 +46,7 @@ static const uint8_t guest_code[] = {
 	0x88, 0xe0, 0xe6, DEBUG_IO_PORT,	/* mov al, ah; out 0xe9, al */
 	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
 	0xcc,					/* int3 */
+	0x0f, 0x0b,				/* ud2 */
 	0xfb,					/* sti */
 	0x90,					/* nop */
 	0xf4,					/* hlt */
@@ -57,6 +60,16 @@ static const uint8_t irq_handler[] = {
 
 static const uint8_t bp_handler[] = {
 	0xb0, 'B', 0xe6, DEBUG_IO_PORT,	/* mov al, 'B'; out 0xe9, al */
+	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+	0xcf,					/* iret */
+};
+
+static const uint8_t ud_handler[] = {
+	0x55,					/* push bp */
+	0x89, 0xe5,				/* mov bp, sp */
+	0x83, 0x46, 0x02, 0x02,		/* add word [bp + 2], 2 */
+	0x5d,					/* pop bp */
+	0xb0, 'U', 0xe6, DEBUG_IO_PORT,	/* mov al, 'U'; out 0xe9, al */
 	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
 	0xcf,					/* iret */
 };
@@ -117,6 +130,7 @@ static int setup_guest_memory(int vm_fd, void **guest_mem)
 	memcpy((uint8_t *)mem + GUEST_CODE_ADDR, guest_code, sizeof(guest_code));
 	memcpy((uint8_t *)mem + IRQ_HANDLER_ADDR, irq_handler, sizeof(irq_handler));
 	memcpy((uint8_t *)mem + BP_HANDLER_ADDR, bp_handler, sizeof(bp_handler));
+	memcpy((uint8_t *)mem + UD_HANDLER_ADDR, ud_handler, sizeof(ud_handler));
 
 	ivt_entry = (uint8_t *)mem + IRQ_VECTOR * 4;
 	ivt_entry[0] = IRQ_HANDLER_ADDR & 0xff;
@@ -127,6 +141,12 @@ static int setup_guest_memory(int vm_fd, void **guest_mem)
 	ivt_entry = (uint8_t *)mem + BP_INT_VECTOR * 4;
 	ivt_entry[0] = BP_HANDLER_ADDR & 0xff;
 	ivt_entry[1] = BP_HANDLER_ADDR >> 8;
+	ivt_entry[2] = 0;
+	ivt_entry[3] = 0;
+
+	ivt_entry = (uint8_t *)mem + UD_INT_VECTOR * 4;
+	ivt_entry[0] = UD_HANDLER_ADDR & 0xff;
+	ivt_entry[1] = UD_HANDLER_ADDR >> 8;
 	ivt_entry[2] = 0;
 	ivt_entry[3] = 0;
 

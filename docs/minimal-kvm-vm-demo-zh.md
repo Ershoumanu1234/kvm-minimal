@@ -14,6 +14,7 @@
 - `run->request_interrupt_window` 触发 `KVM_EXIT_IRQ_WINDOW_OPEN`。
 - `KVM_INTERRUPT` 注入 vector `0x20`，guest 通过 IVT 跳到 handler。
 - `int3` 触发 #BP/vector 3，guest 通过 IVT[3] 跳到 handler。
+- `ud2` 触发 #UD/vector 6，guest handler 修改栈上返回 IP 后跳过 faulting instruction。
 - `trace-cmd` 可对照底层 `kvm_entry` / `kvm_exit` / `kvm_userspace_exit`。
 
 预期输出：
@@ -25,10 +26,11 @@ KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=1 data=0x7856
 KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=0 data=0x4f4b
 OK
 B
+U
 KVM_EXIT_IRQ_WINDOW_OPEN: inject IRQ 0x20
 I
 KVM_EXIT_HLT
-io exits: 20
+io exits: 22
 mmio exits: 2
 ```
 
@@ -1063,7 +1065,71 @@ sregs.idt.base = 0;
 sregs.idt.limit = 0xffff;
 ```
 
-## 9. 下一步验证方向
+## 9. `ud2` / #UD fault 异常实验代码差异与实测
+
+`int3`/#BP 和 `ud2`/#UD 都是 guest 内部异常，但返回语义不同：`int3` 是 trap，CPU 保存的返回 IP 指向 `int3` 后一条指令；`ud2` 触发的 #UD 是 fault，CPU 保存的返回 IP 仍指向 faulting `ud2` 本身。如果 #UD handler 直接 `iret`，guest 会再次执行同一条 `ud2`，于是无限进入 #UD handler。
+
+新增 vector 和 handler 地址：
+
+```c
+#define UD_INT_VECTOR	0x06
+#define UD_HANDLER_ADDR 0x1400
+```
+
+在 guest code 中，`int3` 后插入两字节非法指令：
+
+```text
+0f 0b             ud2
+```
+
+#UD handler 需要先修改栈上保存的返回 IP，让 `iret` 返回到 `ud2` 后面的 `sti`：
+
+```c
+static const uint8_t ud_handler[] = {
+	0x55,					/* push bp */
+	0x89, 0xe5,				/* mov bp, sp */
+	0x83, 0x46, 0x02, 0x02,		/* add word [bp + 2], 2 */
+	0x5d,					/* pop bp */
+	0xb0, 'U', 0xe6, DEBUG_IO_PORT,	/* mov al, 'U'; out 0xe9, al */
+	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+	0xcf,					/* iret */
+};
+```
+
+这里不能直接编码 `add word [sp], 2`，因为 16-bit addressing mode 没有 `[sp]` 这种寻址形式。handler 使用 `bp` 建立一个临时栈帧：`push bp` 后，原异常返回 IP 位于 `[bp + 2]`；把它加 2 后，`pop bp; iret` 会跳过两字节 `ud2`。
+
+在 guest memory 初始化时，把 handler 拷贝到 `0x1400`，并设置 IVT[6]：
+
+```c
+memcpy((uint8_t *)mem + UD_HANDLER_ADDR, ud_handler, sizeof(ud_handler));
+
+ivt_entry = (uint8_t *)mem + UD_INT_VECTOR * 4;
+ivt_entry[0] = UD_HANDLER_ADDR & 0xff;
+ivt_entry[1] = UD_HANDLER_ADDR >> 8;
+ivt_entry[2] = 0;
+ivt_entry[3] = 0;
+```
+
+实测输出：
+
+```text
+KVM API version: 12
+guest output: KVMDEMO12345
+KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=1 data=0x7856
+KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=0 data=0x4f4b
+OK
+B
+U
+KVM_EXIT_IRQ_WINDOW_OPEN: inject IRQ 0x20
+I
+KVM_EXIT_HLT
+io exits: 22
+mmio exits: 2
+```
+
+`U` 只出现一次，说明 #UD handler 成功把返回 IP 从 `ud2` 本身推进到下一条指令；后续仍能进入 interrupt window、注入 IRQ，并最终 `hlt` 退出。
+
+## 10. 下一步验证方向
 
 后续可以按以下顺序继续往下层探索：
 
@@ -1073,7 +1139,7 @@ sregs.idt.limit = 0xffff;
 4. 扩展 demo 增加 MMIO 访问，观察 `KVM_EXIT_MMIO`。
 5. 再回到 kvmtool 的 `kvm_cpu__start()`，理解正式 VMM 如何处理更多 exit reason。
 
-## 10. 当前结论
+## 11. 当前结论
 
 本轮实验已经验证了 CPU 虚拟化第一章的最小可观察闭环：
 
