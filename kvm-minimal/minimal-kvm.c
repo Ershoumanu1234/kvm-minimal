@@ -13,21 +13,52 @@
 #define GUEST_MEM_SIZE	0x4000
 #define GUEST_CODE_ADDR	0x1000
 #define DEBUG_IO_PORT	0xe9
+#define MMIO_TEST_ADDR	0x5000
+#define IRQ_VECTOR	0x20
+#define IRQ_HANDLER_ADDR 0x1200
+#define BP_INT_VECTOR	0x03
+#define BP_HANDLER_ADDR 0x1300
 
 static const uint8_t guest_code[] = {
-	0xb0, 'H', 0xe6, DEBUG_IO_PORT,
-	0xb0, 'e', 0xe6, DEBUG_IO_PORT,
-	0xb0, 'l', 0xe6, DEBUG_IO_PORT,
-	0xb0, 'l', 0xe6, DEBUG_IO_PORT,
-	0xb0, 'o', 0xe6, DEBUG_IO_PORT,
-	0xb0, ',', 0xe6, DEBUG_IO_PORT,
-	0xb0, ' ', 0xe6, DEBUG_IO_PORT,
-	0xb0, 'K', 0xe6, DEBUG_IO_PORT,
-	0xb0, 'V', 0xe6, DEBUG_IO_PORT,
-	0xb0, 'M', 0xe6, DEBUG_IO_PORT,
-	0xb0, '!', 0xe6, DEBUG_IO_PORT,
+	0x31, 0xc0,			/* xor eax, eax */
+	0x0f, 0xa2,			/* cpuid */
+	0x88, 0xd8, 0xe6, DEBUG_IO_PORT,	/* mov al, bl; out 0xe9, al */
+	0x88, 0xf8, 0xe6, DEBUG_IO_PORT,	/* mov al, bh; out 0xe9, al */
+	0x66, 0xc1, 0xeb, 0x10,		/* shr ebx, 16 */
+	0x88, 0xd8, 0xe6, DEBUG_IO_PORT,
+	0x88, 0xf8, 0xe6, DEBUG_IO_PORT,
+	0x88, 0xd0, 0xe6, DEBUG_IO_PORT,	/* mov al, dl; out 0xe9, al */
+	0x88, 0xf0, 0xe6, DEBUG_IO_PORT,	/* mov al, dh; out 0xe9, al */
+	0x66, 0xc1, 0xea, 0x10,		/* shr edx, 16 */
+	0x88, 0xd0, 0xe6, DEBUG_IO_PORT,
+	0x88, 0xf0, 0xe6, DEBUG_IO_PORT,
+	0x88, 0xc8, 0xe6, DEBUG_IO_PORT,	/* mov al, cl; out 0xe9, al */
+	0x88, 0xe8, 0xe6, DEBUG_IO_PORT,	/* mov al, ch; out 0xe9, al */
+	0x66, 0xc1, 0xe9, 0x10,		/* shr ecx, 16 */
+	0x88, 0xc8, 0xe6, DEBUG_IO_PORT,
+	0x88, 0xe8, 0xe6, DEBUG_IO_PORT,
 	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
-	0xf4,
+	0xc7, 0x06, 0x00, 0x50, 0x78, 0x56,	/* mov word [0x5000], 0x5678 */
+	0xa1, 0x00, 0x50,			/* mov ax, [0x5000] */
+	0xe6, DEBUG_IO_PORT,			/* out 0xe9, al */
+	0x88, 0xe0, 0xe6, DEBUG_IO_PORT,	/* mov al, ah; out 0xe9, al */
+	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+	0xcc,					/* int3 */
+	0xfb,					/* sti */
+	0x90,					/* nop */
+	0xf4,					/* hlt */
+};
+
+static const uint8_t irq_handler[] = {
+	0xb0, 'I', 0xe6, DEBUG_IO_PORT,	/* mov al, 'I'; out 0xe9, al */
+	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+	0xcf,					/* iret */
+};
+
+static const uint8_t bp_handler[] = {
+	0xb0, 'B', 0xe6, DEBUG_IO_PORT,	/* mov al, 'B'; out 0xe9, al */
+	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+	0xcf,					/* iret */
 };
 
 static void die(const char *msg)
@@ -73,6 +104,7 @@ static int open_kvm(void)
 static int setup_guest_memory(int vm_fd, void **guest_mem)
 {
 	struct kvm_userspace_memory_region region;
+	uint8_t *ivt_entry;
 	void *mem;
 
 	mem = mmap(NULL, GUEST_MEM_SIZE, PROT_READ | PROT_WRITE,
@@ -83,6 +115,20 @@ static int setup_guest_memory(int vm_fd, void **guest_mem)
 	}
 
 	memcpy((uint8_t *)mem + GUEST_CODE_ADDR, guest_code, sizeof(guest_code));
+	memcpy((uint8_t *)mem + IRQ_HANDLER_ADDR, irq_handler, sizeof(irq_handler));
+	memcpy((uint8_t *)mem + BP_HANDLER_ADDR, bp_handler, sizeof(bp_handler));
+
+	ivt_entry = (uint8_t *)mem + IRQ_VECTOR * 4;
+	ivt_entry[0] = IRQ_HANDLER_ADDR & 0xff;
+	ivt_entry[1] = IRQ_HANDLER_ADDR >> 8;
+	ivt_entry[2] = 0;
+	ivt_entry[3] = 0;
+
+	ivt_entry = (uint8_t *)mem + BP_INT_VECTOR * 4;
+	ivt_entry[0] = BP_HANDLER_ADDR & 0xff;
+	ivt_entry[1] = BP_HANDLER_ADDR >> 8;
+	ivt_entry[2] = 0;
+	ivt_entry[3] = 0;
 
 	region = (struct kvm_userspace_memory_region) {
 		.slot = 0,
@@ -119,6 +165,54 @@ static struct kvm_run *mmap_kvm_run(int kvm_fd, int vcpu_fd, int *mmap_size)
 	return run;
 }
 
+static uint32_t pack4(char a, char b, char c, char d)
+{
+	return (uint32_t)a | (uint32_t)b << 8 |
+	       (uint32_t)c << 16 | (uint32_t)d << 24;
+}
+
+static int setup_cpuid(int kvm_fd, int vcpu_fd)
+{
+	struct kvm_cpuid_entry2 *entry;
+	struct kvm_cpuid2 *cpuid;
+	int i, ret;
+
+	cpuid = calloc(1, sizeof(*cpuid) + 100 * sizeof(cpuid->entries[0]));
+	if (!cpuid) {
+		perror("calloc cpuid");
+		return -1;
+	}
+	cpuid->nent = 100;
+
+	ret = kvm_ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid,
+			"KVM_GET_SUPPORTED_CPUID");
+	if (ret < 0)
+		goto out;
+
+	for (i = 0; i < (int)cpuid->nent; i++) {
+		entry = &cpuid->entries[i];
+		if (entry->function != 0 || entry->index != 0)
+			continue;
+
+		entry->ebx = pack4('K', 'V', 'M', 'D');
+		entry->edx = pack4('E', 'M', 'O', '1');
+		entry->ecx = pack4('2', '3', '4', '5');
+		break;
+	}
+
+	if (i == (int)cpuid->nent) {
+		fprintf(stderr, "missing CPUID leaf 0\n");
+		ret = -1;
+		goto out;
+	}
+
+	ret = kvm_ioctl(vcpu_fd, KVM_SET_CPUID2, cpuid, "KVM_SET_CPUID2");
+
+out:
+	free(cpuid);
+	return ret;
+}
+
 static int setup_real_mode(int vcpu_fd)
 {
 	struct kvm_sregs sregs;
@@ -145,6 +239,8 @@ static int setup_real_mode(int vcpu_fd)
 	sregs.ss.selector = 0;
 	sregs.ss.base = 0;
 	sregs.ss.limit = 0xffff;
+	sregs.idt.base = 0;
+	sregs.idt.limit = 0xffff;
 	sregs.cr0 &= ~1ULL;
 
 	if (kvm_ioctl(vcpu_fd, KVM_SET_SREGS, &sregs, "KVM_SET_SREGS") < 0)
@@ -180,12 +276,55 @@ static void handle_io_exit(struct kvm_run *run, unsigned int *io_exits)
 	(*io_exits)++;
 }
 
+static int inject_interrupt(int vcpu_fd)
+{
+	struct kvm_interrupt irq = {
+		.irq = IRQ_VECTOR,
+	};
+
+	return kvm_ioctl(vcpu_fd, KVM_INTERRUPT, &irq, "KVM_INTERRUPT");
+}
+
+static void handle_mmio_exit(struct kvm_run *run, unsigned int *mmio_exits)
+{
+	uint32_t i;
+
+	if (run->mmio.phys_addr != MMIO_TEST_ADDR || run->mmio.len != 2) {
+		fprintf(stderr,
+			"unexpected MMIO exit: addr=0x%llx len=%u is_write=%u\n",
+			(unsigned long long)run->mmio.phys_addr, run->mmio.len,
+			run->mmio.is_write);
+		exit(EXIT_FAILURE);
+	}
+
+	if (run->mmio.is_write &&
+	    (run->mmio.data[0] != 0x78 || run->mmio.data[1] != 0x56)) {
+		fprintf(stderr, "unexpected MMIO write data\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (!run->mmio.is_write) {
+		run->mmio.data[0] = 'O';
+		run->mmio.data[1] = 'K';
+	}
+
+	printf("KVM_EXIT_MMIO: addr=0x%llx len=%u is_write=%u data=0x",
+	       (unsigned long long)run->mmio.phys_addr, run->mmio.len,
+	       run->mmio.is_write);
+	for (i = 0; i < run->mmio.len; i++)
+		printf("%02x", run->mmio.data[i]);
+	printf("\n");
+	(*mmio_exits)++;
+}
+
 static void run_vcpu(int vcpu_fd, struct kvm_run *run)
 {
-	unsigned int io_exits = 0;
+	unsigned int io_exits = 0, mmio_exits = 0;
+	int irq_injected = 0;
 
 	printf("guest output: ");
 	fflush(stdout);
+	run->request_interrupt_window = 1;
 
 	for (;;) {
 		if (ioctl(vcpu_fd, KVM_RUN, 0) < 0) {
@@ -198,10 +337,37 @@ static void run_vcpu(int vcpu_fd, struct kvm_run *run)
 		case KVM_EXIT_IO:
 			handle_io_exit(run, &io_exits);
 			break;
+		case KVM_EXIT_MMIO:
+			handle_mmio_exit(run, &mmio_exits);
+			break;
+		case KVM_EXIT_IRQ_WINDOW_OPEN:
+			printf("KVM_EXIT_IRQ_WINDOW_OPEN: inject IRQ 0x%x\n",
+			       IRQ_VECTOR);
+			run->request_interrupt_window = 0;
+			if (inject_interrupt(vcpu_fd) < 0)
+				exit(EXIT_FAILURE);
+			irq_injected = 1;
+			break;
 		case KVM_EXIT_HLT:
+			if (!irq_injected) {
+				fprintf(stderr, "KVM_EXIT_HLT before IRQ window\n");
+				exit(EXIT_FAILURE);
+			}
 			printf("KVM_EXIT_HLT\n");
 			printf("io exits: %u\n", io_exits);
+			printf("mmio exits: %u\n", mmio_exits);
 			return;
+		case KVM_EXIT_FAIL_ENTRY:
+			fprintf(stderr, "KVM_EXIT_FAIL_ENTRY: hardware_entry_failure_reason=0x%llx\n",
+				(unsigned long long)run->fail_entry.hardware_entry_failure_reason);
+			exit(EXIT_FAILURE);
+		case KVM_EXIT_INTERNAL_ERROR:
+			fprintf(stderr, "KVM_EXIT_INTERNAL_ERROR: suberror=0x%x\n",
+				run->internal.suberror);
+			exit(EXIT_FAILURE);
+		case KVM_EXIT_SHUTDOWN:
+			fprintf(stderr, "KVM_EXIT_SHUTDOWN\n");
+			exit(EXIT_FAILURE);
 		default:
 			fprintf(stderr, "unexpected exit reason: %u\n",
 				run->exit_reason);
@@ -233,6 +399,9 @@ int main(void)
 
 	run = mmap_kvm_run(kvm_fd, vcpu_fd, &run_mmap_size);
 	if (run == MAP_FAILED)
+		goto out;
+
+	if (setup_cpuid(kvm_fd, vcpu_fd) < 0)
 		goto out;
 
 	if (setup_real_mode(vcpu_fd) < 0)
