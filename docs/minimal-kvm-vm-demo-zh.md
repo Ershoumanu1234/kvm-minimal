@@ -15,6 +15,8 @@
 - `KVM_INTERRUPT` 注入 vector `0x20`，guest 通过 IVT 跳到 handler。
 - `int3` 触发 #BP/vector 3，guest 通过 IVT[3] 跳到 handler。
 - `ud2` 触发 #UD/vector 6，guest handler 修改栈上返回 IP 后跳过 faulting instruction。
+- `KVM_GET_REGS` 在 VM-exit 后观察 vCPU 的 `RIP/RSP/RFLAGS/RAX/RBX/RCX/RDX`。
+- `KVM_SET_REGS` 修改 `RAX.AL`，让 guest 后续 `out` 输出被 userspace 改写后的值。
 - `trace-cmd` 可对照底层 `kvm_entry` / `kvm_exit` / `kvm_userspace_exit`。
 
 预期输出：
@@ -23,14 +25,21 @@
 KVM API version: 12
 guest output: KVMDEMO12345
 KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=1 data=0x7856
+KVM_EXIT_MMIO regs: rip=0x104a rsp=0x2000 rflags=0x12 rax=0xa rbx=0x444d rcx=0x3534 rdx=0x314f
 KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=0 data=0x4f4b
+KVM_EXIT_MMIO regs: rip=0x104a rsp=0x2000 rflags=0x12 rax=0xa rbx=0x444d rcx=0x3534 rdx=0x314f
 OK
 B
 U
+?KVM_EXIT_IO before KVM_SET_REGS regs: rip=0x105c rsp=0x2000 rflags=0x12 rax=0x4b3f rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_IO after KVM_SET_REGS regs: rip=0x105c rsp=0x2000 rflags=0x12 rax=0x4b52 rbx=0x444d rcx=0x3534 rdx=0x314f
+R
+KVM_EXIT_IRQ_WINDOW_OPEN regs: rip=0x1066 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
 KVM_EXIT_IRQ_WINDOW_OPEN: inject IRQ 0x20
 I
+KVM_EXIT_HLT regs: rip=0x1067 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
 KVM_EXIT_HLT
-io exits: 22
+io exits: 25
 mmio exits: 2
 ```
 
@@ -1129,7 +1138,131 @@ mmio exits: 2
 
 `U` 只出现一次，说明 #UD handler 成功把返回 IP 从 `ud2` 本身推进到下一条指令；后续仍能进入 interrupt window、注入 IRQ，并最终 `hlt` 退出。
 
-## 10. 下一步验证方向
+## 10. `KVM_GET_REGS` / `KVM_SET_REGS` vCPU 寄存器读写实验
+
+本阶段验证 userspace VMM 不只能通过 `struct kvm_run` 看到 exit reason，还可以在 vCPU 停在 VM-exit 边界时读取和修改 guest 通用寄存器。
+
+新增两个 helper：
+
+```c
+static void dump_regs(int vcpu_fd, const char *where)
+{
+	struct kvm_regs regs;
+
+	if (kvm_ioctl(vcpu_fd, KVM_GET_REGS, &regs, "KVM_GET_REGS") < 0)
+		exit(EXIT_FAILURE);
+
+	printf("%s regs: rip=0x%llx rsp=0x%llx rflags=0x%llx "
+	       "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n",
+	       where, (unsigned long long)regs.rip,
+	       (unsigned long long)regs.rsp,
+	       (unsigned long long)regs.rflags,
+	       (unsigned long long)regs.rax,
+	       (unsigned long long)regs.rbx,
+	       (unsigned long long)regs.rcx,
+	       (unsigned long long)regs.rdx);
+}
+
+static int set_al(int vcpu_fd, uint8_t value)
+{
+	struct kvm_regs regs;
+
+	if (kvm_ioctl(vcpu_fd, KVM_GET_REGS, &regs, "KVM_GET_REGS") < 0)
+		return -1;
+
+	regs.rax = (regs.rax & ~0xffULL) | value;
+	return kvm_ioctl(vcpu_fd, KVM_SET_REGS, &regs, "KVM_SET_REGS");
+}
+```
+
+`dump_regs()` 用 `KVM_GET_REGS` 读取当前 vCPU 寄存器；`set_al()` 先读取完整 `struct kvm_regs`，只改 `RAX` 的低 8 位 `AL`，再用 `KVM_SET_REGS` 写回。这样不会误改 `RIP/RSP/RFLAGS`。
+
+guest 指令流在 #UD 之后、`sti` 之前插入一个 marker：
+
+```c
+#define REGS_TEST_MARKER '?'
+#define REGS_TEST_VALUE	'R'
+
+0xb0, REGS_TEST_MARKER, 0xe6, DEBUG_IO_PORT,
+0xe6, DEBUG_IO_PORT,
+0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+```
+
+对应汇编语义：
+
+```asm
+mov al, '?'
+out 0xe9, al
+out 0xe9, al
+mov al, '\n'
+out 0xe9, al
+```
+
+第一次 `out` 会输出 `?` 并触发 `KVM_EXIT_IO`。userspace 在这次 exit 中发现 `data[0] == '?'`，先打印修改前寄存器，再把 `AL` 改成 `'R'`：
+
+```c
+if (!*regs_updated && run->io.count == 1 &&
+    data[0] == REGS_TEST_MARKER) {
+	dump_regs(vcpu_fd, "KVM_EXIT_IO before KVM_SET_REGS");
+	if (set_al(vcpu_fd, REGS_TEST_VALUE) < 0)
+		exit(EXIT_FAILURE);
+	dump_regs(vcpu_fd, "KVM_EXIT_IO after KVM_SET_REGS");
+	*regs_updated = 1;
+}
+```
+
+随后 userspace 再次 `KVM_RUN`，guest 从第一条 `out` 后继续执行第二条 `out`。由于 `AL` 已经被 userspace 改成 `'R'`，第二条 `out` 输出 `R`。这就证明 `KVM_SET_REGS` 写回的寄存器状态会影响后续 guest 执行。
+
+本阶段还在 MMIO、IRQ window 和 HLT exit 处打印寄存器：
+
+```c
+dump_regs(vcpu_fd, "KVM_EXIT_MMIO");
+dump_regs(vcpu_fd, "KVM_EXIT_IRQ_WINDOW_OPEN");
+dump_regs(vcpu_fd, "KVM_EXIT_HLT");
+```
+
+实测输出：
+
+```text
+KVM API version: 12
+guest output: KVMDEMO12345
+KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=1 data=0x7856
+KVM_EXIT_MMIO regs: rip=0x104a rsp=0x2000 rflags=0x12 rax=0xa rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_MMIO: addr=0x5000 len=2 is_write=0 data=0x4f4b
+KVM_EXIT_MMIO regs: rip=0x104a rsp=0x2000 rflags=0x12 rax=0xa rbx=0x444d rcx=0x3534 rdx=0x314f
+OK
+B
+U
+?KVM_EXIT_IO before KVM_SET_REGS regs: rip=0x105c rsp=0x2000 rflags=0x12 rax=0x4b3f rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_IO after KVM_SET_REGS regs: rip=0x105c rsp=0x2000 rflags=0x12 rax=0x4b52 rbx=0x444d rcx=0x3534 rdx=0x314f
+R
+KVM_EXIT_IRQ_WINDOW_OPEN regs: rip=0x1066 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_IRQ_WINDOW_OPEN: inject IRQ 0x20
+I
+KVM_EXIT_HLT regs: rip=0x1067 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_HLT
+io exits: 25
+mmio exits: 2
+```
+
+重点观察：
+
+```text
+before: rax=0x4b3f  -> AL = 0x3f = '?'
+after : rax=0x4b52  -> AL = 0x52 = 'R'
+```
+
+因此本实验同时验证了：
+
+```text
+KVM_GET_REGS 可以在 VM-exit 后读取 guest vCPU 状态
+KVM_SET_REGS 可以修改 guest vCPU 状态
+修改后的寄存器会在下一次 KVM_RUN 后被 guest 继续使用
+```
+
+另外，`KVM_EXIT_IRQ_WINDOW_OPEN` 和 `KVM_EXIT_HLT` 的 `rflags=0x212` 中包含 `IF=1`，和前面的 `sti; nop` 实验相互印证：guest 已经打开 maskable interrupt，再进入可注入中断窗口。
+
+## 11. 下一步验证方向
 
 后续可以按以下顺序继续往下层探索：
 
@@ -1139,7 +1272,7 @@ mmio exits: 2
 4. 扩展 demo 增加 MMIO 访问，观察 `KVM_EXIT_MMIO`。
 5. 再回到 kvmtool 的 `kvm_cpu__start()`，理解正式 VMM 如何处理更多 exit reason。
 
-## 11. 当前结论
+## 12. 当前结论
 
 本轮实验已经验证了 CPU 虚拟化第一章的最小可观察闭环：
 

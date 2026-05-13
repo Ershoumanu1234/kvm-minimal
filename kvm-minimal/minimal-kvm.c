@@ -20,6 +20,8 @@
 #define BP_HANDLER_ADDR 0x1300
 #define UD_INT_VECTOR	0x06
 #define UD_HANDLER_ADDR 0x1400
+#define REGS_TEST_MARKER '?'
+#define REGS_TEST_VALUE	'R'
 
 static const uint8_t guest_code[] = {
 	0x31, 0xc0,			/* xor eax, eax */
@@ -47,6 +49,9 @@ static const uint8_t guest_code[] = {
 	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
 	0xcc,					/* int3 */
 	0x0f, 0x0b,				/* ud2 */
+	0xb0, REGS_TEST_MARKER, 0xe6, DEBUG_IO_PORT,
+	0xe6, DEBUG_IO_PORT,
+	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
 	0xfb,					/* sti */
 	0x90,					/* nop */
 	0xf4,					/* hlt */
@@ -233,6 +238,35 @@ out:
 	return ret;
 }
 
+static void dump_regs(int vcpu_fd, const char *where)
+{
+	struct kvm_regs regs;
+
+	if (kvm_ioctl(vcpu_fd, KVM_GET_REGS, &regs, "KVM_GET_REGS") < 0)
+		exit(EXIT_FAILURE);
+
+	printf("%s regs: rip=0x%llx rsp=0x%llx rflags=0x%llx "
+	       "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx\n",
+	       where, (unsigned long long)regs.rip,
+	       (unsigned long long)regs.rsp,
+	       (unsigned long long)regs.rflags,
+	       (unsigned long long)regs.rax,
+	       (unsigned long long)regs.rbx,
+	       (unsigned long long)regs.rcx,
+	       (unsigned long long)regs.rdx);
+}
+
+static int set_al(int vcpu_fd, uint8_t value)
+{
+	struct kvm_regs regs;
+
+	if (kvm_ioctl(vcpu_fd, KVM_GET_REGS, &regs, "KVM_GET_REGS") < 0)
+		return -1;
+
+	regs.rax = (regs.rax & ~0xffULL) | value;
+	return kvm_ioctl(vcpu_fd, KVM_SET_REGS, &regs, "KVM_SET_REGS");
+}
+
 static int setup_real_mode(int vcpu_fd)
 {
 	struct kvm_sregs sregs;
@@ -275,7 +309,8 @@ static int setup_real_mode(int vcpu_fd)
 	return kvm_ioctl(vcpu_fd, KVM_SET_REGS, &regs, "KVM_SET_REGS");
 }
 
-static void handle_io_exit(struct kvm_run *run, unsigned int *io_exits)
+static void handle_io_exit(int vcpu_fd, struct kvm_run *run,
+			   unsigned int *io_exits, int *regs_updated)
 {
 	uint8_t *data;
 	uint32_t i;
@@ -293,6 +328,16 @@ static void handle_io_exit(struct kvm_run *run, unsigned int *io_exits)
 	for (i = 0; i < run->io.count; i++)
 		putchar(data[i]);
 	fflush(stdout);
+
+	if (!*regs_updated && run->io.count == 1 &&
+	    data[0] == REGS_TEST_MARKER) {
+		dump_regs(vcpu_fd, "KVM_EXIT_IO before KVM_SET_REGS");
+		if (set_al(vcpu_fd, REGS_TEST_VALUE) < 0)
+			exit(EXIT_FAILURE);
+		dump_regs(vcpu_fd, "KVM_EXIT_IO after KVM_SET_REGS");
+		*regs_updated = 1;
+	}
+
 	(*io_exits)++;
 }
 
@@ -305,7 +350,8 @@ static int inject_interrupt(int vcpu_fd)
 	return kvm_ioctl(vcpu_fd, KVM_INTERRUPT, &irq, "KVM_INTERRUPT");
 }
 
-static void handle_mmio_exit(struct kvm_run *run, unsigned int *mmio_exits)
+static void handle_mmio_exit(int vcpu_fd, struct kvm_run *run,
+			     unsigned int *mmio_exits)
 {
 	uint32_t i;
 
@@ -334,13 +380,14 @@ static void handle_mmio_exit(struct kvm_run *run, unsigned int *mmio_exits)
 	for (i = 0; i < run->mmio.len; i++)
 		printf("%02x", run->mmio.data[i]);
 	printf("\n");
+	dump_regs(vcpu_fd, "KVM_EXIT_MMIO");
 	(*mmio_exits)++;
 }
 
 static void run_vcpu(int vcpu_fd, struct kvm_run *run)
 {
 	unsigned int io_exits = 0, mmio_exits = 0;
-	int irq_injected = 0;
+	int irq_injected = 0, regs_updated = 0;
 
 	printf("guest output: ");
 	fflush(stdout);
@@ -355,12 +402,13 @@ static void run_vcpu(int vcpu_fd, struct kvm_run *run)
 
 		switch (run->exit_reason) {
 		case KVM_EXIT_IO:
-			handle_io_exit(run, &io_exits);
+			handle_io_exit(vcpu_fd, run, &io_exits, &regs_updated);
 			break;
 		case KVM_EXIT_MMIO:
-			handle_mmio_exit(run, &mmio_exits);
+			handle_mmio_exit(vcpu_fd, run, &mmio_exits);
 			break;
 		case KVM_EXIT_IRQ_WINDOW_OPEN:
+			dump_regs(vcpu_fd, "KVM_EXIT_IRQ_WINDOW_OPEN");
 			printf("KVM_EXIT_IRQ_WINDOW_OPEN: inject IRQ 0x%x\n",
 			       IRQ_VECTOR);
 			run->request_interrupt_window = 0;
@@ -373,6 +421,7 @@ static void run_vcpu(int vcpu_fd, struct kvm_run *run)
 				fprintf(stderr, "KVM_EXIT_HLT before IRQ window\n");
 				exit(EXIT_FAILURE);
 			}
+			dump_regs(vcpu_fd, "KVM_EXIT_HLT");
 			printf("KVM_EXIT_HLT\n");
 			printf("io exits: %u\n", io_exits);
 			printf("mmio exits: %u\n", mmio_exits);
