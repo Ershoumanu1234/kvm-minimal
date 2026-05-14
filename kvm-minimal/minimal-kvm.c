@@ -22,6 +22,8 @@
 #define UD_HANDLER_ADDR 0x1400
 #define REGS_TEST_MARKER '?'
 #define REGS_TEST_VALUE	'R'
+#define RIP_TEST_MARKER 'A'
+#define RIP_TEST_TARGET (GUEST_CODE_ADDR + 0x6c) /* mov al, 'B' */
 
 static const uint8_t guest_code[] = {
 	0x31, 0xc0,			/* xor eax, eax */
@@ -51,6 +53,10 @@ static const uint8_t guest_code[] = {
 	0x0f, 0x0b,				/* ud2 */
 	0xb0, REGS_TEST_MARKER, 0xe6, DEBUG_IO_PORT,
 	0xe6, DEBUG_IO_PORT,
+	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+	0xb0, RIP_TEST_MARKER, 0xe6, DEBUG_IO_PORT,
+	0xb0, 'X', 0xe6, DEBUG_IO_PORT,
+	0xb0, 'B', 0xe6, DEBUG_IO_PORT,
 	0xb0, '\n', 0xe6, DEBUG_IO_PORT,
 	0xfb,					/* sti */
 	0x90,					/* nop */
@@ -267,6 +273,17 @@ static int set_al(int vcpu_fd, uint8_t value)
 	return kvm_ioctl(vcpu_fd, KVM_SET_REGS, &regs, "KVM_SET_REGS");
 }
 
+static int set_rip(int vcpu_fd, uint64_t rip)
+{
+	struct kvm_regs regs;
+
+	if (kvm_ioctl(vcpu_fd, KVM_GET_REGS, &regs, "KVM_GET_REGS") < 0)
+		return -1;
+
+	regs.rip = rip;
+	return kvm_ioctl(vcpu_fd, KVM_SET_REGS, &regs, "KVM_SET_REGS");
+}
+
 static int setup_real_mode(int vcpu_fd)
 {
 	struct kvm_sregs sregs;
@@ -310,7 +327,8 @@ static int setup_real_mode(int vcpu_fd)
 }
 
 static void handle_io_exit(int vcpu_fd, struct kvm_run *run,
-			   unsigned int *io_exits, int *regs_updated)
+			   unsigned int *io_exits, int *regs_updated,
+			   int *rip_updated)
 {
 	uint8_t *data;
 	uint32_t i;
@@ -336,6 +354,15 @@ static void handle_io_exit(int vcpu_fd, struct kvm_run *run,
 			exit(EXIT_FAILURE);
 		dump_regs(vcpu_fd, "KVM_EXIT_IO after KVM_SET_REGS");
 		*regs_updated = 1;
+	}
+
+	if (!*rip_updated && run->io.count == 1 &&
+	    data[0] == RIP_TEST_MARKER) {
+		dump_regs(vcpu_fd, "KVM_EXIT_IO before RIP jump");
+		if (set_rip(vcpu_fd, RIP_TEST_TARGET) < 0)
+			exit(EXIT_FAILURE);
+		dump_regs(vcpu_fd, "KVM_EXIT_IO after RIP jump");
+		*rip_updated = 1;
 	}
 
 	(*io_exits)++;
@@ -387,7 +414,7 @@ static void handle_mmio_exit(int vcpu_fd, struct kvm_run *run,
 static void run_vcpu(int vcpu_fd, struct kvm_run *run)
 {
 	unsigned int io_exits = 0, mmio_exits = 0;
-	int irq_injected = 0, regs_updated = 0;
+	int irq_injected = 0, regs_updated = 0, rip_updated = 0;
 
 	printf("guest output: ");
 	fflush(stdout);
@@ -402,7 +429,8 @@ static void run_vcpu(int vcpu_fd, struct kvm_run *run)
 
 		switch (run->exit_reason) {
 		case KVM_EXIT_IO:
-			handle_io_exit(vcpu_fd, run, &io_exits, &regs_updated);
+			handle_io_exit(vcpu_fd, run, &io_exits, &regs_updated,
+				       &rip_updated);
 			break;
 		case KVM_EXIT_MMIO:
 			handle_mmio_exit(vcpu_fd, run, &mmio_exits);

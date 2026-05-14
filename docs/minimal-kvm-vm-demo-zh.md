@@ -17,6 +17,7 @@
 - `ud2` 触发 #UD/vector 6，guest handler 修改栈上返回 IP 后跳过 faulting instruction。
 - `KVM_GET_REGS` 在 VM-exit 后观察 vCPU 的 `RIP/RSP/RFLAGS/RAX/RBX/RCX/RDX`。
 - `KVM_SET_REGS` 修改 `RAX.AL`，让 guest 后续 `out` 输出被 userspace 改写后的值。
+- `KVM_SET_REGS` 修改 `RIP`，让 guest 跳过一段原本会执行的指令。
 - `trace-cmd` 可对照底层 `kvm_entry` / `kvm_exit` / `kvm_userspace_exit`。
 
 预期输出：
@@ -34,12 +35,15 @@ U
 ?KVM_EXIT_IO before KVM_SET_REGS regs: rip=0x105c rsp=0x2000 rflags=0x12 rax=0x4b3f rbx=0x444d rcx=0x3534 rdx=0x314f
 KVM_EXIT_IO after KVM_SET_REGS regs: rip=0x105c rsp=0x2000 rflags=0x12 rax=0x4b52 rbx=0x444d rcx=0x3534 rdx=0x314f
 R
-KVM_EXIT_IRQ_WINDOW_OPEN regs: rip=0x1066 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
+AKVM_EXIT_IO before RIP jump regs: rip=0x1066 rsp=0x2000 rflags=0x12 rax=0x4b41 rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_IO after RIP jump regs: rip=0x106c rsp=0x2000 rflags=0x12 rax=0x4b41 rbx=0x444d rcx=0x3534 rdx=0x314f
+B
+KVM_EXIT_IRQ_WINDOW_OPEN regs: rip=0x1076 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
 KVM_EXIT_IRQ_WINDOW_OPEN: inject IRQ 0x20
 I
-KVM_EXIT_HLT regs: rip=0x1067 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_HLT regs: rip=0x1077 rsp=0x2000 rflags=0x212 rax=0x4b0a rbx=0x444d rcx=0x3534 rdx=0x314f
 KVM_EXIT_HLT
-io exits: 25
+io exits: 28
 mmio exits: 2
 ```
 
@@ -1262,7 +1266,101 @@ KVM_SET_REGS 可以修改 guest vCPU 状态
 
 另外，`KVM_EXIT_IRQ_WINDOW_OPEN` 和 `KVM_EXIT_HLT` 的 `rflags=0x212` 中包含 `IF=1`，和前面的 `sti; nop` 实验相互印证：guest 已经打开 maskable interrupt，再进入可注入中断窗口。
 
-## 11. 下一步验证方向
+## 11. `KVM_SET_REGS` 修改 `RIP` 跳转实验
+
+上一节只修改 `RAX.AL`，不会改变 guest 控制流。本阶段继续验证：userspace VMM 能否在 VM-exit 边界直接修改 `RIP`，让 guest 跳过原本会执行的指令。
+
+新增常量：
+
+```c
+#define RIP_TEST_MARKER 'A'
+#define RIP_TEST_TARGET (GUEST_CODE_ADDR + 0x6c) /* mov al, 'B' */
+```
+
+`RIP_TEST_TARGET` 指向 guest code 中 `mov al, 'B'` 的地址。这个地址是一个教学实验用的固定偏移：如果后续调整前面的 guest 指令字节，必须同步检查该偏移。
+
+guest 指令流在 `? -> R` 寄存器修改实验之后、`sti` 之前插入：
+
+```c
+0xb0, RIP_TEST_MARKER, 0xe6, DEBUG_IO_PORT,
+0xb0, 'X', 0xe6, DEBUG_IO_PORT,
+0xb0, 'B', 0xe6, DEBUG_IO_PORT,
+0xb0, '\n', 0xe6, DEBUG_IO_PORT,
+```
+
+对应汇编语义：
+
+```asm
+mov al, 'A'
+out 0xe9, al
+mov al, 'X'
+out 0xe9, al
+mov al, 'B'
+out 0xe9, al
+mov al, '\n'
+out 0xe9, al
+```
+
+如果 userspace 不改 `RIP`，guest 会输出：
+
+```text
+AXB
+```
+
+本实验在 guest 输出 `A` 的 `KVM_EXIT_IO` 中，把 `RIP` 从原本的下一条 `mov al, 'X'` 改成 `mov al, 'B'`：
+
+```c
+static int set_rip(int vcpu_fd, uint64_t rip)
+{
+	struct kvm_regs regs;
+
+	if (kvm_ioctl(vcpu_fd, KVM_GET_REGS, &regs, "KVM_GET_REGS") < 0)
+		return -1;
+
+	regs.rip = rip;
+	return kvm_ioctl(vcpu_fd, KVM_SET_REGS, &regs, "KVM_SET_REGS");
+}
+```
+
+触发逻辑：
+
+```c
+if (!*rip_updated && run->io.count == 1 &&
+    data[0] == RIP_TEST_MARKER) {
+	dump_regs(vcpu_fd, "KVM_EXIT_IO before RIP jump");
+	if (set_rip(vcpu_fd, RIP_TEST_TARGET) < 0)
+		exit(EXIT_FAILURE);
+	dump_regs(vcpu_fd, "KVM_EXIT_IO after RIP jump");
+	*rip_updated = 1;
+}
+```
+
+实测输出：
+
+```text
+AKVM_EXIT_IO before RIP jump regs: rip=0x1066 rsp=0x2000 rflags=0x12 rax=0x4b41 rbx=0x444d rcx=0x3534 rdx=0x314f
+KVM_EXIT_IO after RIP jump regs: rip=0x106c rsp=0x2000 rflags=0x12 rax=0x4b41 rbx=0x444d rcx=0x3534 rdx=0x314f
+B
+```
+
+重点观察：
+
+```text
+before: rip=0x1066  -> 原本会继续执行 mov al, 'X'
+after : rip=0x106c  -> 改为执行 mov al, 'B'
+```
+
+最终输出中没有 `X`，说明 guest 控制流确实被 userspace 改写。后续仍然正常进入 `sti; nop`、`KVM_EXIT_IRQ_WINDOW_OPEN`、IRQ handler 和 `KVM_EXIT_HLT`，说明这次跳转只跳过了 `X` 片段，没有破坏后续 vCPU 流程。
+
+这个实验说明：
+
+```text
+vCPU 的 RIP 就是 guest 下一次进入后继续取指的位置
+userspace 可以在 VM-exit 边界通过 KVM_SET_REGS 改写 RIP
+改写 RIP 会直接改变 guest 后续控制流
+```
+
+## 12. 下一步验证方向
 
 后续可以按以下顺序继续往下层探索：
 
@@ -1272,7 +1370,7 @@ KVM_SET_REGS 可以修改 guest vCPU 状态
 4. 扩展 demo 增加 MMIO 访问，观察 `KVM_EXIT_MMIO`。
 5. 再回到 kvmtool 的 `kvm_cpu__start()`，理解正式 VMM 如何处理更多 exit reason。
 
-## 12. 当前结论
+## 13. 当前结论
 
 本轮实验已经验证了 CPU 虚拟化第一章的最小可观察闭环：
 
